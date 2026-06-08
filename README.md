@@ -1,183 +1,172 @@
 # ternary-svm
 
-Support vector machines for ternary feature spaces {-1, 0, +1} — with ternary-aware kernels, SMO training, and one-vs-rest 3-class classification.
+Support Vector Machines for ternary feature spaces {-1, 0, +1}, with ternary-aware kernels, SMO training, and one-vs-rest 3-class classification.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+## The Problem
 
----
+You have feature vectors where every dimension is a trit: {-1, 0, +1}. Maybe they came from quantized neural network activations, maybe from a sensor that only reports under/normal/over. You want to classify them.
 
-## Why this exists
+Standard SVMs work — technically. You can feed ternary vectors to a linear kernel or an RBF kernel with Euclidean distance and get answers. But those kernels don't understand the discrete structure of your data. In Euclidean space, the distance between +1 and 0 is 1.0, and the distance between +1 and -1 is 2.0. That ratio (2:1) doesn't capture the fact that +1 and -1 are *opposites* — qualitatively different from +1 and 0 (which is just "signal present" vs "signal absent").
 
-SVMs are geometric classifiers — they find the hyperplane that maximizes the margin between classes. Standard kernels (RBF with Euclidean distance, polynomial with dot products) assume continuous features. When your data is ternary, those kernels miss the discrete structure: the distance between +1 and −1 isn't 2.0 like Euclidean says, it's an *opposition* — a qualitatively different relationship than +1 vs 0.
+You need kernels that know the difference between disagreement and opposition.
 
-This crate provides kernels that respect the three-level ternary distance metric directly, yielding tighter margins and better generalization on quantized data.
+## The Insight
 
-## The key insight
+The ternary dot product `x · y` is a natural kernel because it captures three relationships simultaneously:
 
-The ternary dot product is a natural kernel. When two trit vectors are aligned (+1×+1 = +1, −1×−1 = +1), the dot product is high. When they oppose (+1×−1 = −1), it's negative. When one is silent (×0 = 0), it contributes nothing — a built-in soft attention mechanism. The RBF kernel on ternary distance amplifies this: `K(x,y) = exp(−γ · d(x,y))` where d costs 0 for agreement, 1 for soft disagreement, and 2 for opposition.
+| x | y | x·y | Meaning |
+|---|---|-----|---------|
+| +1 | +1 | +1 | Agreement |
+| -1 | -1 | +1 | Agreement (same direction) |
+| +1 | -1 | -1 | Opposition |
+| ±1 | 0 | 0 | One signal is silent |
+| 0 | 0 | 0 | Both silent |
 
-## Quick Start
+The zeros act as a built-in soft attention mechanism — dimensions where one vector is silent contribute nothing to the similarity score. This is something Euclidean RBF can't replicate.
+
+The ternary distance metric encodes three levels: agreement (d=0), soft disagreement (d=1, e.g., +1 vs 0), and opposition (d=2, i.e., +1 vs -1). Plugging this into an RBF kernel `K(x,y) = exp(-γ · d(x,y))` gives you a similarity function that correctly treats opposition as fundamentally different from mere disagreement.
+
+## How It Works
+
+### Kernel functions
+
+- **Linear**: `K(x, y) = x · y` — the ternary dot product directly.
+- **Ternary polynomial**: `K(x, y) = (x · y + c)^d` — raises the dot product to a power, capturing interactions between trit positions.
+- **Ternary RBF**: `K(x, y) = exp(-γ · d(x,y))` where d uses the three-level distance. The bandwidth γ controls how quickly similarity decays across the three levels.
+
+### SMO training
+
+The binary SVM implements Platt's Simplified Sequential Minimal Optimization. The full kernel matrix K[i][j] is precomputed once during `fit` (O(n²·d)). Then SMO iterates over pairs of Lagrange multipliers (αᵢ, αⱼ), optimizing each pair analytically while clamping to the box constraint [0, C]. Convergence is measured by consecutive passes with no constraint violations.
+
+The algorithm: pick αᵢ that violates KKT conditions. Pick αⱼ (currently the next index). Compute η = 2K[i][j] - K[i][i] - K[j][j]. Update αⱼ with a constrained step. Update αᵢ to maintain the linear constraint. Update bias b from the KKT complementarity conditions. Repeat.
+
+### One-vs-rest multiclass
+
+`TernarySVM` trains three binary SVMs — one for each class {-1, 0, +1}. Each binary SVM treats its class as +1 and the other two as -1. At prediction time, all three decision functions are evaluated and the class with the highest score wins.
+
+## Code Example
 
 ```rust
-use ternary_svm::{BinarySVM, TernarySVM, Kernel};
+use ternary_svm::{BinarySVM, TernarySVM, Kernel, trit_distance_f64};
 
-// ── Binary classification with linear kernel ──
+// ── Binary classification with a linear kernel ──
 let x = vec![
-    vec![1, 1, 1], vec![1, 1, 0],     // class +1
-    vec![-1, -1, -1], vec![-1, -1, 0], // class -1
+    vec![1, 1, 1], vec![1, 1, 0], vec![1, 0, 1],    // class +1
+    vec![-1, -1, -1], vec![-1, -1, 0], vec![-1, 0, -1], // class -1
 ];
-let y = vec![1.0, 1.0, -1.0, -1.0];
+let y = vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
 
 let mut svm = BinarySVM::new(Kernel::Linear, 10.0);
 svm.fit(&x, &y, 1000).unwrap();
 
-let pred = svm.predict(&[1, 1, 0]).unwrap(); // → 1.0
-let decision = svm.decision_function(&[1, 0, 0]); // signed distance to hyperplane
-let margin = svm.margin();         // minimum functional margin
-let sv = svm.support_vectors();    // indices of support vectors
+assert_eq!(svm.predict(&[1, 1, 0]).unwrap(), 1.0);
+assert_eq!(svm.predict(&[-1, -1, 0]).unwrap(), -1.0);
 
-// ── Ternary RBF kernel (recommended for non-linear ternary data) ──
-let mut rbf_svm = BinarySVM::new(Kernel::TernaryRBF { gamma: 1.0 }, 10.0);
+// Inspect the learned model
+let margin = svm.margin();              // minimum functional margin
+let sv_indices = svm.support_vectors(); // which training points are support vectors
+let alphas = svm.alphas();              // Lagrange multipliers
+let bias = svm.bias();                  // decision boundary offset
+
+// ── Ternary RBF kernel (recommended for non-linear boundaries) ──
+let mut rbf_svm = BinarySVM::new(Kernel::TernaryRBF { gamma: 1.0 }, 100.0);
 rbf_svm.fit(&x, &y, 1000).unwrap();
 
-// ── Polynomial kernel ──
+// ── Polynomial kernel for interaction features ──
 let mut poly_svm = BinarySVM::new(
-    Kernel::TernaryPolynomial { degree: 3.0, constant: 1.0 }, 10.0,
+    Kernel::TernaryPolynomial { degree: 3.0, constant: 1.0 },
+    100.0,
 );
 
-// ── 3-class classification (one-vs-rest) ──
-let x = vec![
-    vec![1, 1, 1], vec![1, 1, 0], vec![1, 0, 1], vec![1, 1, 1],   // class +1
-    vec![0, 0, 0], vec![0, 0, 0], vec![0, 0, 0], vec![0, 0, 0],   // class 0
+// ── 3-class classification (one-vs-rest over {-1, 0, +1}) ──
+let x3 = vec![
+    vec![1, 1, 1], vec![1, 1, 0], vec![1, 0, 1], vec![1, 1, 1],    // class +1
+    vec![0, 0, 0], vec![0, 0, 0], vec![0, 0, 0], vec![0, 0, 0],    // class  0
     vec![-1, -1, -1], vec![-1, -1, 0], vec![-1, 0, -1], vec![-1, -1, -1], // class -1
 ];
-let y = vec![1i8, 1, 1, 1, 0, 0, 0, 0, -1, -1, -1, -1];
+let y3 = vec![1i8, 1, 1, 1, 0, 0, 0, 0, -1, -1, -1, -1];
 
 let mut ternary = TernarySVM::new(Kernel::TernaryRBF { gamma: 1.0 }, 100.0);
-ternary.fit(&x, &y, 1000).unwrap();
+ternary.fit(&x3, &y3, 1000).unwrap();
 
-let class = ternary.predict(&[1, 1, 1]).unwrap(); // → 1
+assert_eq!(ternary.predict(&[1, 1, 1]).unwrap(), 1);
+assert_eq!(ternary.predict(&[0, 0, 0]).unwrap(), 0);
+assert_eq!(ternary.predict(&[-1, -1, -1]).unwrap(), -1);
+
+// Inspect per-class classifiers
+let class_pos_svm = ternary.classifier(1).unwrap();
+println!("Support vectors for class +1: {:?}", class_pos_svm.support_vectors());
+
+// ── Ternary distance directly ──
+let d = trit_distance_f64(&[1, -1, 0], &[1, -1, 0]); // 0.0 (identical)
+let d = trit_distance_f64(&[1, 1, 1], &[-1, -1, -1]); // 6.0 (full opposition)
 ```
 
-## Architecture
+## Module Map
+
+Everything in `src/lib.rs`.
 
 ```
-                    ┌──────────────────────────┐
-  Training data ──→ │   Kernel precomputation   │
-  (ternary vecs)    │   K[i][j] for all pairs   │
-                    └──────────┬────────────────┘
-                               ▼
-                    ┌──────────────────────────┐
-                    │   Simplified SMO          │
-                    │   (Platt's algorithm)     │
-                    │   Optimize α₁, α₂ pairs  │
-                    │   until KKT satisfied     │
-                    └──────────┬────────────────┘
-                               ▼
-               ┌───────────────┴───────────────┐
-               ▼                               ▼
-    ┌──────────────────┐            ┌──────────────────┐
-    │  BinarySVM       │            │  TernarySVM       │
-    │  Single hyperplane│           │  3 × BinarySVM   │
-    │  predict: ±1     │            │  One-vs-rest      │
-    │  margin, SVs     │            │  predict: {-1,0,1}│
-    └──────────────────┘            └──────────────────┘
+Trit                  — type alias for i8 (values -1, 0, 1)
+validate_ternary      — check all elements are in {-1, 0, +1}
+
+Kernel                — enum { Linear, TernaryPolynomial{degree,constant}, TernaryRBF{gamma} }
+  .apply(a, b)        — kernel function on two ternary vectors
+
+BinarySVM             — single-hyperplane classifier
+  .new(kernel, c)     — C is the soft-margin penalty
+  .fit(x, y, max_passes) — SMO training, precomputes full kernel matrix
+  .predict(x)         — ±1.0
+  .decision_function(x) — signed distance to hyperplane
+  .margin()           — minimum functional margin over support vectors
+  .support_vectors()  — indices of training points with α > 0
+  .alphas()           — Lagrange multipliers
+  .bias()             — learned offset b
+
+TernarySVM            — one-vs-rest for 3-class {-1, 0, +1}
+  .new(kernel, c)
+  .fit(x, y, max_passes) — y: i8 in {-1, 0, 1}
+  .predict(x)         — i8, class with highest decision function
+  .classifier(class)  — access the underlying BinarySVM
+
+dot(a, b)             — ternary dot product (private)
+trit_distance_f64(a, b) — three-level distance: 0=agree, 1=soft, 2=oppose
 ```
 
-## Kernel Functions
+## Design Decisions
 
-### Linear: `K(x, y) = x · y`
+**Full kernel matrix materialization.** During `fit`, the entire n×n kernel matrix is computed and stored in memory. This makes each SMO iteration O(n) instead of O(n·d), but it means training uses O(n²) memory. For n > 10K, you'll need to add kernel caching or approximate methods. This was a deliberate tradeoff: correctness and clarity over scalability for the initial implementation.
 
-The ternary dot product naturally captures alignment: matching signs contribute +1, opposing signs −1, zeros are neutral. No normalization needed — the output is bounded by the dimension.
+**j selection is sequential, not heuristic.** Platt's original SMO paper recommends selecting j to maximize |Eᵢ - Eⱼ| for faster convergence. This crate uses `(i + 1) % n` instead. Simpler code, same eventual convergence, potentially more SMO passes needed. For the typical use case (small to medium ternary datasets), the difference is negligible.
 
-### Polynomial: `K(x, y) = (x · y + c)^d`
+**`Trit` is `i8`, not an enum.** The `ternary-quantize` crate defines `Trit` as an enum `{Neg, Zero, Pos}`. This crate uses `type Trit = i8`. The two can't be interchanged directly. The `i8` choice makes the math natural (multiply, dot product) at the cost of not catching invalid values at the type level — `validate_ternary()` exists as a runtime check instead.
 
-Amplifies the ternary dot product. Higher degrees capture interactions between trit positions — useful when the decision boundary depends on *combinations* of features, not individual ones.
+**No serialization.** Trained models can't be saved to disk. You'd need to manually extract the support vectors, alphas, and bias, and reconstruct the SVM yourself. This is a real gap for production use.
 
-### Ternary RBF: `K(x, y) = exp(−γ · d(x, y))`
+**Labels are `f64` for binary, `i8` for ternary.** The binary SVM takes `y: &[f64]` with values ±1.0. The ternary SVM takes `y: &[i8]` with values {-1, 0, 1}. This inconsistency is because the binary SVM uses `y[i]` as a multiplier in the SMO update (needs to be f64), while the ternary SVM maps class labels to binary targets internally.
 
-The recommended kernel for non-linearly separable ternary data. Uses the three-level ternary distance directly: agreement (d=0) gives K=1, opposition (d=2) gives K=exp(−2γ). The bandwidth γ controls how quickly similarity decays.
+## Status
 
-## API Reference
+- **12 tests passing.** All three kernels on known values, linearly separable classification, RBF on non-linear data, margin computation, support vector identification, ternary 3-class classification, polynomial classification, decision function sign correctness.
+- **Functional for small to medium datasets.** The SMO implementation is correct and converges. It's not optimized for large-scale problems.
+- **Known gaps:**
+  - O(n²) memory for the kernel matrix — no kernel caching
+  - No model serialization or persistence
+  - Sequential j selection (not Platt's heuristic)
+  - No probability estimates (Platt scaling not implemented)
+  - No online/incremental learning — SMO is batch-only
+  - `Trit` type (`i8`) doesn't match `ternary-quantize`'s `Trit` enum
 
-### Kernel
+## Ecosystem
 
-```rust
-pub enum Kernel {
-    Linear,
-    TernaryPolynomial { degree: f64, constant: f64 },
-    TernaryRBF { gamma: f64 },
-}
-// kernel.apply(a: &[Trit], b: &[Trit]) -> f64
-```
+- [`ternary-quantize`](https://github.com/SuperInstance/ternary-quantize) — produces the ternary features this crate classifies
+- [`ternary-optimizer`](https://github.com/SuperInstance/ternary-optimizer) — sign-based training for ternary networks
+- [`ternary-em`](https://github.com/SuperInstance/ternary-em) — cluster analysis of ternary distributions
 
-### BinarySVM
+## References
 
-```rust
-let mut svm = BinarySVM::new(kernel: Kernel, c: f64);
-svm.fit(x: &[Vec<Trit>], y: &[f64], max_passes: usize) -> Result<(), String>;
-svm.predict(x: &[Trit]) -> Result<f64, String>;           // → ±1.0
-svm.decision_function(x: &[Trit]) -> f64;                  // signed distance
-svm.margin() -> f64;                                        // min functional margin
-svm.support_vectors() -> &[usize];                          // SV indices
-svm.alphas() -> &[f64];                                    // Lagrange multipliers
-svm.bias() -> f64;                                         // bias term b
-```
-
-### TernarySVM (one-vs-rest)
-
-```rust
-let mut svm = TernarySVM::new(kernel: Kernel, c: f64);
-svm.fit(x: &[Vec<Trit>], y: &[i8], max_passes: usize) -> Result<(), String>;
-svm.predict(x: &[Trit]) -> Result<i8, String>;             // → {-1, 0, 1}
-svm.classifier(class: i8) -> Option<&BinarySVM>;           // inspect per-class SVM
-```
-
-### Utilities
-
-```rust
-fn trit_distance_f64(a: &[Trit], b: &[Trit]) -> f64;  // ternary distance
-fn validate_ternary(vec: &[Trit]) -> Result<(), String>;
-```
-
-## Real-world example
-
-A data center monitors server health as ternary vectors: each dimension is CPU load (−1: underutilized, 0: normal, +1: overloaded), memory pressure, disk IO, network congestion — 16 features per server. You want to classify servers into three states: healthy (0), degraded (+1), critical (−1).
-
-With 1000 labeled servers and the TernaryRBF kernel (γ=0.5), the SVM finds non-linear decision boundaries that separate the three classes. The ternary RBF kernel outperforms a standard RBF because it treats the +1-to-−1 gap as fundamentally different from the +1-to-0 gap — overloaded vs underutilized is a harder signal mismatch than overloaded vs normal.
-
-## Ecosystem connections
-
-- **[`ternary-quantize`](https://github.com/SuperInstance/ternary-quantize)** — produces the ternary features this crate classifies
-- **[`ternary-knn`](https://github.com/SuperInstance/ternary-knn)** — non-parametric alternative (no training, slower inference)
-- **[`ternary-hmm`](https://github.com/SuperInstance/ternary-hmm)** — for temporal sequences where SVMs ignore ordering
-- **[`ternary-transformer`](https://github.com/SuperInstance/ternary-transformer)** — produces ternary embeddings for downstream classification
-
-## Performance
-
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| Kernel precomputation | O(n²·d) | Done once during `fit` |
-| SMO iteration | O(n²) per pass | n = training samples |
-| `predict` | O(|SV|·d) | Only support vectors matter |
-| `decision_function` | O(|SV|·d) | Same as predict without sign |
-
-The full kernel matrix is materialized during training. For n > 10K, consider SMO with kernel caching or approximate methods.
-
-## Open questions
-
-- **Kernel selection**: Is there a theoretically optimal γ for ternary RBF, or must it always be cross-validated?
-- **Multiclass beyond 3**: One-vs-rest with 3 classes is natural for ternary labels. For more classes, would an error-correcting output code scheme work better?
-- **Online learning**: SMO is batch-only. Can ternary SVMs support incremental updates when new labeled vectors arrive?
-- **Sparse ternary kernels**: When >50% of trits are zero, can we skip zero positions in the dot product for a 2× speedup?
-
-## Testing
-
-```bash
-cargo test
-```
-
-10 tests: all 3 kernels (linear, polynomial, RBF) on known values, linearly separable classification, margin computation, support vector identification, RBF on non-linear data, ternary 3-class classification, decision function sign correctness.
+- Platt, J. C. (1998). *Sequential Minimal Optimization: A Fast Algorithm for Training Support Vector Machines*.
+- Bernstein, J. et al. (2018). *signSGD: Compressed Optimisation for Non-Convex Problems*. [arXiv:1802.04434](https://arxiv.org/abs/1802.04434)
 
 ## License
 
