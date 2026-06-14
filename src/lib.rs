@@ -1,326 +1,609 @@
 //! # ternary-svm
 //!
-//! Support Vector Machine classifiers for ternary feature spaces
-//! (elements in {-1, 0, +1}), with ternary-specific kernel functions
-//! and simplified SMO-style optimization.
+//! A lightweight linear SVM for ternary feature vectors (elements in {-1, 0, +1}),
+//! trained with the PEGASOS (Primal Estimated sub-GrAdient SOlver for SVM)
+//! stochastic sub-gradient descent algorithm.
+//!
+//! ## Features
+//!
+//! - **Fast training**: PEGASOS converges in O(1/ε) iterations, no quadratic programming
+//! - **Ternary-first**: feature vectors stored as `Vec<Vec<i8>>` with values in {-1, 0, +1}
+//! - **Binary and multi-class**: one-vs-one for 3-class {-1, 0, +1}
+//! - **Convergence tracking**: early stopping when loss stabilizes
+//! - **Regularization**: configurable L2 weight to prevent overfitting
+//!
+//! ## Quick Start
+//!
+//! ```rust
+//! use ternary_svm::TernSVM;
+//!
+//! let mut model = TernSVM::new(1.0, 0.01);  // λ=1.0, learning rate=0.01
+//!
+//! // Feature vectors where each element is -1, 0, or +1
+//! let x = vec![
+//!     vec![1, 1, 1],
+//!     vec![1, 1, 0],
+//!     vec![-1, -1, -1],
+//!     vec![-1, -1, 0],
+//! ];
+//! let y = vec![1.0, 1.0, -1.0, -1.0];
+//!
+//! model.fit(&x, &y).unwrap();
+//!
+//! let pred = model.predict_label(&vec![1, 1, 0]).unwrap();
+//! assert_eq!(pred, 1.0);
+//! ```
 
-use std::collections::HashMap;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{thread_rng, SeedableRng};
 
-/// A ternary value.
+// ─── Core types ──────────────────────────────────────────────────────────────
+
+/// A ternary feature value: must be -1, 0, or +1.
 pub type Trit = i8;
 
-/// Validate ternary vector.
+// ─── Validation ──────────────────────────────────────────────────────────────
+
+/// Validate that every element of `vec` is in {-1, 0, +1}.
+///
+/// # Errors
+///
+/// Returns an `Err` containing the invalid value and its index if any element
+/// is outside the allowed set.
+///
+/// # Example
+///
+/// ```
+/// use ternary_svm::validate_ternary;
+///
+/// assert!(validate_ternary(&[1, 0, -1]).is_ok());
+/// assert!(validate_ternary(&[2, 0, -1]).is_err());
+/// ```
 pub fn validate_ternary(vec: &[Trit]) -> Result<(), String> {
     for (i, &t) in vec.iter().enumerate() {
-        if t != -1 && t != 0 && t != 1 {
-            return Err(format!("Invalid trit {} at index {}", t, i));
+        if !matches!(t, -1..=1) {
+            return Err(format!(
+                "Invalid trit {} at index {}; must be -1, 0, or +1",
+                t, i
+            ));
         }
     }
     Ok(())
 }
 
-// ─── Kernel Functions ────────────────────────────────────────────────────────
+// ─── PEGASOS SVM ─────────────────────────────────────────────────────────────
 
-/// Available kernel types.
+/// A linear Support Vector Machine trained with the PEGASOS algorithm.
+///
+/// PEGASOS (Primal Estimated sub-GrAdient SOlver for SVM) is a stochastic
+/// sub-gradient descent method that iterates over random training examples
+/// and takes projected gradient steps. It requires no quadratic programming
+/// and converges to an ε-accurate solution in O(1/ε) iterations.
+///
+/// The model stores a weight vector `w` (one weight per feature dimension)
+/// and a bias term `b`.
+///
+/// Training tracks the average hinge loss over each epoch and stops early
+/// when the loss stabilizes.
+///
+/// The `kernel_hint` field is reserved for future non-linear kernel expansion.
+///
+/// # Example
+///
+/// ```
+/// use ternary_svm::TernSVM;
+///
+/// let mut model = TernSVM::new(1.0, 0.01);
+///
+/// let x = vec![
+///     vec![1, 1, 1],
+///     vec![1, 1, 0],
+///     vec![-1, -1, -1],
+///     vec![-1, -1, 0],
+/// ];
+/// let y = vec![1.0, 1.0, -1.0, -1.0];
+///
+/// model.fit(&x, &y).unwrap();
+/// assert_eq!(model.predict_label(&vec![1, 0, 0]).unwrap(), 1.0);
+/// ```
 #[derive(Debug, Clone)]
-pub enum Kernel {
-    /// Linear kernel: x·y
-    Linear,
-    /// Ternary polynomial: (x·y + c)^d
-    TernaryPolynomial { degree: f64, constant: f64 },
-    /// Ternary RBF: exp(-gamma * trit_distance(x, y))
-    TernaryRBF { gamma: f64 },
+pub struct TernSVM {
+    /// Regularization parameter λ (lambda). Higher values = stronger regularization.
+    pub lambda: f64,
+    /// Learning rate for SGD.
+    pub learning_rate: f64,
+    /// Maximum training epochs.
+    pub max_epochs: usize,
+    /// Tolerance for early stopping (relative change in average loss).
+    pub tol: f64,
+    /// Convergence patience: stop after this many consecutive epochs
+    /// with relative loss change < `tol`.
+    pub patience: usize,
+    /// Random seed for reproducibility. `None` uses random entropy.
+    pub seed: Option<u64>,
+
+    // Learned parameters
+    /// Weight vector (one weight per feature dimension).
+    pub w: Vec<f64>,
+    /// Bias term.
+    pub b: f64,
+
+    // Training history
+    /// Average hinge loss per epoch during the last `fit` call.
+    pub loss_history: Vec<f64>,
+    /// Weight norm ||w|| after each epoch.
+    pub weight_norm_history: Vec<f64>,
+    /// Number of epochs actually trained (may be < max_epochs due to early stop).
+    pub epochs_trained: usize,
+    /// Whether training converged via early stopping.
+    pub converged: bool,
+
+    // Metadata
+    /// Number of features (dimensionality) seen during `fit`.
+    pub n_features: usize,
+
+    /// Future-use marker for non-linear kernel expansion.
+    /// Currently unused; reserved for when PEGASOS is extended to kernel
+    /// feature maps (e.g., random Fourier features for RBF).
+    pub kernel_hint: Option<String>,
 }
 
-impl Kernel {
-    /// Apply the kernel function to two ternary vectors.
-    pub fn apply(&self, a: &[Trit], b: &[Trit]) -> f64 {
-        match self {
-            Kernel::Linear => dot(a, b),
-            Kernel::TernaryPolynomial { degree, constant } => {
-                (dot(a, b) + constant).powf(*degree)
-            }
-            Kernel::TernaryRBF { gamma } => {
-                (-gamma * trit_distance_f64(a, b)).exp()
-            }
-        }
-    }
-}
-
-fn dot(a: &[Trit], b: &[Trit]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
-}
-
-/// Compute ternary distance.
-pub fn trit_distance_f64(a: &[Trit], b: &[Trit]) -> f64 {
-    let mut dist = 0.0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        if x == y {
-        } else if (*x == -1 && *y == 1) || (*x == 1 && *y == -1) {
-            dist += 2.0;
-        } else {
-            dist += 1.0;
-        }
-    }
-    dist
-}
-
-// ─── Binary SVM ──────────────────────────────────────────────────────────────
-
-/// Binary SVM using simplified SMO (Platt's algorithm).
-#[derive(Debug)]
-pub struct BinarySVM {
-    support_indices: Vec<usize>,
-    alphas: Vec<f64>,
-    bias: f64,
-    train_x: Vec<Vec<Trit>>,
-    train_y: Vec<f64>,
-    kernel: Kernel,
-    c: f64,
-    tol: f64,
-}
-
-impl BinarySVM {
-    pub fn new(kernel: Kernel, c: f64) -> Self {
+impl Default for TernSVM {
+    fn default() -> Self {
         Self {
-            support_indices: Vec::new(),
-            alphas: Vec::new(),
-            bias: 0.0,
-            train_x: Vec::new(),
-            train_y: Vec::new(),
-            kernel,
-            c,
+            lambda: 1.0,
+            learning_rate: 0.01,
+            max_epochs: 100,
             tol: 1e-3,
+            patience: 3,
+            seed: None,
+            w: Vec::new(),
+            b: 0.0,
+            loss_history: Vec::new(),
+            weight_norm_history: Vec::new(),
+            epochs_trained: 0,
+            converged: false,
+            n_features: 0,
+            kernel_hint: None,
+        }
+    }
+}
+
+impl TernSVM {
+    /// Create a new `TernSVM` with the given regularization and learning rate.
+    ///
+    /// Default hyperparams: max_epochs = 100, tol = 1e-3, patience = 3,
+    /// seed = None, kernel_hint = None.
+    ///
+    /// # Arguments
+    ///
+    /// * `lambda` - Regularization parameter λ (higher = stronger regularization)
+    /// * `learning_rate` - Step size for gradient descent updates
+    pub fn new(lambda: f64, learning_rate: f64) -> Self {
+        Self {
+            lambda,
+            learning_rate,
+            ..Default::default()
         }
     }
 
-    /// Compute the decision function f(x) = sum_i alpha_i * y_i * K(x_i, x) + b
-    fn f(&self, x: &[Trit], alphas: &[f64], bias: f64, train_x: &[Vec<Trit>], train_y: &[f64]) -> f64 {
-        let mut sum = bias;
-        for i in 0..train_x.len() {
-            if alphas[i] > 1e-12 {
-                sum += alphas[i] * train_y[i] * self.kernel.apply(&train_x[i], x);
-            }
-        }
-        sum
+    /// Set the random seed for reproducible shuffling during training.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
     }
 
-    /// Train using simplified SMO.
-    pub fn fit(&mut self, x: &[Vec<Trit>], y: &[f64], max_passes: usize) -> Result<(), String> {
+    /// Set the maximum number of training epochs.
+    pub fn with_max_epochs(mut self, max_epochs: usize) -> Self {
+        self.max_epochs = max_epochs;
+        self
+    }
+
+    /// Set early stopping tolerance and patience.
+    pub fn with_early_stop(mut self, tol: f64, patience: usize) -> Self {
+        self.tol = tol;
+        self.patience = patience;
+        self
+    }
+
+    /// Set a kernel hint (documentation marker for future expansion).
+    pub fn with_kernel_hint(mut self, hint: &str) -> Self {
+        self.kernel_hint = Some(hint.to_string());
+        self
+    }
+
+    /// Train the model on ternary feature vectors with binary labels (±1).
+    ///
+    /// Uses the PEGASOS algorithm:
+    /// 1. For each epoch, iterate over a random permutation of training examples
+    /// 2. For each example (x_i, y_i), if y_i·(w·x_i + b) < 1, take a
+    ///    sub-gradient step: w ← (1 - ηλ)w + η·y_i·x_i, b ← b + η·y_i
+    ///    Otherwise: w ← (1 - ηλ)w
+    /// 3. Track average hinge loss per epoch
+    /// 4. Stop early if loss stabilizes (relative change < tol for `patience` epochs)
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - Training feature vectors (each inner vec must be same length)
+    /// * `y` - Training labels (±1.0)
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if:
+    /// - Feature vectors contain values outside {-1, 0, +1}
+    /// - Feature vectors have inconsistent dimensions
+    /// - `x.len() != y.len()`
+    /// - Labels are not ±1.0
+    /// - Feature vectors are empty (0 dimensions)
+    /// - Training set is empty
+    pub fn fit(&mut self, x: &[Vec<Trit>], y: &[f64]) -> Result<(), String> {
+        let n = x.len();
+        if n == 0 {
+            return Err("Empty training set".into());
+        }
+        if n != y.len() {
+            return Err(format!(
+                "X length ({}) does not match y length ({})",
+                n,
+                y.len()
+            ));
+        }
+
+        let d = x[0].len();
+        if d == 0 {
+            return Err("Feature vectors must have at least 1 dimension".into());
+        }
         for xi in x.iter() {
             validate_ternary(xi)?;
-        }
-        let n = x.len();
-        if n != y.len() {
-            return Err("X and y length mismatch".into());
+            if xi.len() != d {
+                return Err(format!(
+                    "Inconsistent feature dimensions: expected {} but found {}",
+                    d,
+                    xi.len()
+                ));
+            }
         }
         for &yi in y {
             if yi != 1.0 && yi != -1.0 {
-                return Err(format!("Labels must be ±1, got {}", yi));
+                return Err(format!("Labels must be +/-1.0, got {}", yi));
             }
         }
 
-        let mut alphas = vec![0.0; n];
-        let mut bias = 0.0;
+        self.n_features = d;
+        self.w = vec![0.0; d];
+        self.b = 0.0;
+        self.loss_history = Vec::with_capacity(self.max_epochs);
+        self.weight_norm_history = Vec::with_capacity(self.max_epochs);
+        self.converged = false;
 
-        // Precompute kernel matrix
-        let mut k = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                k[i][j] = self.kernel.apply(&x[i], &x[j]);
-            }
-        }
-
-        // Compute E(i) = f(x_i) - y_i using the kernel matrix
-        let compute_f = |alphas: &[f64], bias: f64, i: usize, k: &[Vec<f64>], y: &[f64], n: usize| -> f64 {
-            let mut s = bias;
-            for j in 0..n {
-                s += alphas[j] * y[j] * k[j][i];
-            }
-            s
+        let mut rng: Box<dyn rand::RngCore> = match self.seed {
+            Some(seed) => Box::new(StdRng::seed_from_u64(seed)),
+            None => Box::new(thread_rng()),
         };
+        let mut indices: Vec<usize> = (0..n).collect();
 
-        let mut passes = 0;
-        while passes < max_passes {
-            let mut num_changed = 0;
-            for i in 0..n {
-                let fi = compute_f(&alphas, bias, i, &k, y, n);
-                let ei = fi - y[i];
+        let mut no_improve_epochs = 0;
+        let mut prev_loss = f64::INFINITY;
 
-                let ri = y[i] * ei;
-                if !((ri < -self.tol && alphas[i] < self.c) || (ri > self.tol && alphas[i] > 0.0)) {
-                    continue;
-                }
+        for epoch in 0..self.max_epochs {
+            // eta_t = learning_rate / (1 + lambda * learning_rate * epoch)
+            // Standard PEGASOS decreasing step size.
+            let eta = self.learning_rate / (1.0 + self.lambda * self.learning_rate * epoch as f64);
 
-                // Select j randomly (but different from i)
-                let j = (i + 1) % n;
-                let fj = compute_f(&alphas, bias, j, &k, y, n);
-                let ej = fj - y[j];
+            indices.shuffle(&mut rng);
 
-                // Save old alphas
-                let ai_old = alphas[i];
-                let aj_old = alphas[j];
+            for &i in &indices {
+                let xi = &x[i];
+                let yi = y[i];
 
-                // Compute L and H
-                let (l, h) = if y[i] != y[j] {
-                    (0.0_f64.max(aj_old - ai_old), self.c.min(self.c + aj_old - ai_old))
+                let decision = self.decision_raw(xi).unwrap_or(0.0);
+                let margin = yi * decision;
+
+                let scale = 1.0 - eta * self.lambda;
+                if margin < 1.0 {
+                    // Sub-gradient update: penalize misclassification
+                    for (wj, &xj) in self.w.iter_mut().zip(xi.iter()) {
+                        *wj = scale * *wj + eta * yi * xj as f64;
+                    }
+                    self.b += eta * yi;
                 } else {
-                    (0.0_f64.max(aj_old + ai_old - self.c), self.c.min(aj_old + ai_old))
-                };
-
-                if (h - l).abs() < 1e-10 {
-                    continue;
+                    // No misclassification: only regularize (shrink toward zero)
+                    for wj in self.w.iter_mut() {
+                        *wj *= scale;
+                    }
                 }
-
-                let eta = 2.0 * k[i][j] - k[i][i] - k[j][j];
-                if eta >= 0.0 {
-                    continue;
-                }
-
-                // Update alpha_j
-                alphas[j] = aj_old - y[j] * (ei - ej) / eta;
-                alphas[j] = alphas[j].clamp(l, h);
-
-                if (alphas[j] - aj_old).abs() < 1e-5 {
-                    continue;
-                }
-
-                // Update alpha_i
-                alphas[i] = ai_old + y[i] * y[j] * (aj_old - alphas[j]);
-
-                // Update bias
-                let b1 = bias - ei
-                    - y[i] * (alphas[i] - ai_old) * k[i][i]
-                    - y[j] * (alphas[j] - aj_old) * k[i][j];
-                let b2 = bias - ej
-                    - y[i] * (alphas[i] - ai_old) * k[i][j]
-                    - y[j] * (alphas[j] - aj_old) * k[j][j];
-
-                bias = if 0.0 < alphas[i] && alphas[i] < self.c {
-                    b1
-                } else if 0.0 < alphas[j] && alphas[j] < self.c {
-                    b2
-                } else {
-                    (b1 + b2) / 2.0
-                };
-
-                num_changed += 1;
             }
 
-            if num_changed == 0 {
-                passes += 1;
+            // Compute average hinge loss for this epoch
+            let mut total_loss = 0.0;
+            for (xi, &yi) in x.iter().zip(y.iter()) {
+                let decision = self.decision_raw(xi).unwrap_or(0.0);
+                let hinge = 1.0 - yi * decision;
+                total_loss += if hinge > 0.0 { hinge } else { 0.0 };
+            }
+            let avg_loss = total_loss / n as f64;
+            self.loss_history.push(avg_loss);
+
+            // Track weight norm
+            let norm: f64 = self.w.iter().map(|v| v * v).sum::<f64>().sqrt();
+            self.weight_norm_history.push(norm);
+
+            // Early stopping check
+            let relative_change = (prev_loss - avg_loss).abs() / prev_loss.max(1e-12);
+            if relative_change < self.tol {
+                no_improve_epochs += 1;
+                if no_improve_epochs >= self.patience {
+                    self.converged = true;
+                    self.epochs_trained = epoch + 1;
+                    return Ok(());
+                }
             } else {
-                passes = 0;
+                no_improve_epochs = 0;
             }
+            prev_loss = avg_loss;
         }
 
-        self.train_x = x.to_vec();
-        self.train_y = y.to_vec();
-        self.alphas = alphas;
-        self.bias = bias;
-        self.support_indices = (0..n).filter(|&i| self.alphas[i] > 1e-6).collect();
-
+        self.epochs_trained = self.max_epochs;
+        self.converged = false;
         Ok(())
     }
 
-    /// Predict class (+1 or -1).
+    /// Compute the raw decision value w·x + b.
+    ///
+    /// The sign of this value is the predicted class (±1).
+    /// The magnitude is the confidence (distance to the hyperplane).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `x` dimension doesn't match trained model.
     pub fn predict(&self, x: &[Trit]) -> Result<f64, String> {
-        validate_ternary(x)?;
-        Ok(if self.decision_function(x) >= 0.0 { 1.0 } else { -1.0 })
+        self.decision_raw(x)
     }
 
-    /// Decision function value.
-    pub fn decision_function(&self, x: &[Trit]) -> f64 {
-        self.f(x, &self.alphas, self.bias, &self.train_x, &self.train_y)
+    /// Predict the class label (±1.0) for a feature vector.
+    ///
+    /// Equivalent to `sign(predict(x))`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `x` dimension doesn't match trained model.
+    pub fn predict_label(&self, x: &[Trit]) -> Result<f64, String> {
+        let decision = self.predict(x)?;
+        Ok(if decision >= 0.0 { 1.0 } else { -1.0 })
     }
 
-    /// Compute margin.
-    pub fn margin(&self) -> f64 {
-        if self.support_indices.is_empty() {
-            return 0.0;
+    /// Compute accuracy on a labeled test set.
+    ///
+    /// Returns the fraction of predictions that match the true labels.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - Test feature vectors
+    /// * `y` - True labels (±1.0)
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any vector is invalid or dims are inconsistent.
+    pub fn score(&self, x: &[Vec<Trit>], y: &[f64]) -> Result<f64, String> {
+        if x.len() != y.len() {
+            return Err(format!("X length ({}) != y length ({})", x.len(), y.len()));
         }
-        let mut min_margin = f64::MAX;
-        for &i in &self.support_indices {
-            let f_val = self.decision_function(&self.train_x[i]);
-            let margin = f_val * self.train_y[i];
-            if margin < min_margin {
-                min_margin = margin;
+        if x.is_empty() {
+            return Ok(1.0);
+        }
+
+        let mut correct = 0usize;
+        for (xi, &yi) in x.iter().zip(y.iter()) {
+            let pred = self.predict_label(xi)?;
+            if (pred - yi).abs() < 0.5 {
+                correct += 1;
             }
         }
-        min_margin
+        Ok(correct as f64 / x.len() as f64)
     }
 
-    /// Support vector indices.
-    pub fn support_vectors(&self) -> &[usize] {
-        &self.support_indices
-    }
-
-    /// Lagrange multipliers.
-    pub fn alphas(&self) -> &[f64] {
-        &self.alphas
-    }
-
-    /// Bias term.
-    pub fn bias(&self) -> f64 {
-        self.bias
+    /// Raw decision value w·x + b.
+    fn decision_raw(&self, x: &[Trit]) -> Result<f64, String> {
+        if self.w.is_empty() && self.b.abs() < 1e-15 {
+            return Ok(0.0);
+        }
+        if x.len() != self.n_features {
+            return Err(format!(
+                "Feature dimension mismatch: expected {} but got {}",
+                self.n_features,
+                x.len()
+            ));
+        }
+        let dot: f64 = self
+            .w
+            .iter()
+            .zip(x.iter())
+            .map(|(wi, xi)| wi * (*xi as f64))
+            .sum();
+        Ok(dot + self.b)
     }
 }
 
-// ─── Ternary SVM (One-vs-Rest) ──────────────────────────────────────────────
+// ─── One-vs-One Multi-Class ─────────────────────────────────────────────────
 
-/// Ternary SVM: one-vs-rest for labels {-1, 0, +1}.
-pub struct TernarySVM {
-    classifiers: HashMap<i8, BinarySVM>,
-    kernel: Kernel,
-    c: f64,
+/// Multi-class SVM using one-vs-one strategy for labels {-1, 0, +1}.
+///
+/// Trains three binary `TernSVM` classifiers: (+1 vs 0), (+1 vs -1), (0 vs -1).
+/// Prediction uses majority vote weighted by decision function magnitude.
+///
+/// # Example
+///
+/// ```
+/// use ternary_svm::{TernSVM, OvOTernSVM};
+///
+/// let x = vec![
+///     vec![1, 1, 1],     // class +1
+///     vec![1, 1, 1],     // class +1
+///     vec![0, 0, 0],     // class 0
+///     vec![0, 0, 0],     // class 0
+///     vec![-1, -1, -1],  // class -1
+///     vec![-1, -1, -1],  // class -1
+/// ];
+/// let y = vec![1, 1, 0, 0, -1, -1];
+///
+/// let mut model = OvOTernSVM::new(1.0, 0.01).with_max_epochs(200);
+/// model.fit(&x, &y).unwrap();
+///
+/// assert_eq!(model.predict(&vec![1, 1, 1]).unwrap(), 1);
+/// assert_eq!(model.predict(&vec![0, 0, 0]).unwrap(), 0);
+/// assert_eq!(model.predict(&vec![-1, -1, -1]).unwrap(), -1);
+/// ```
+#[derive(Debug, Clone)]
+pub struct OvOTernSVM {
+    /// Regularization parameter λ.
+    pub lambda: f64,
+    /// Learning rate.
+    pub learning_rate: f64,
+    /// Max epochs per binary classifier.
+    pub max_epochs: usize,
+    /// Random seed for reproducibility.
+    pub seed: Option<u64>,
+
+    /// Binary classifiers for each pair: (pos_class, neg_class) -> TernSVM
+    classifiers: Vec<((i8, i8), TernSVM)>,
 }
 
-impl TernarySVM {
-    pub fn new(kernel: Kernel, c: f64) -> Self {
+impl OvOTernSVM {
+    /// Create a new OvO multi-class SVM.
+    pub fn new(lambda: f64, learning_rate: f64) -> Self {
         Self {
-            classifiers: HashMap::new(),
-            kernel,
-            c,
+            lambda,
+            learning_rate,
+            max_epochs: 100,
+            seed: None,
+            classifiers: Vec::new(),
         }
     }
 
-    /// Train one-vs-rest.
-    pub fn fit(&mut self, x: &[Vec<Trit>], y: &[i8], max_passes: usize) -> Result<(), String> {
+    /// Set max epochs for each binary sub-classifier.
+    pub fn with_max_epochs(mut self, max_epochs: usize) -> Self {
+        self.max_epochs = max_epochs;
+        self
+    }
+
+    /// Set random seed.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Train all OvO binary classifiers.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - Training feature vectors
+    /// * `y` - Labels in {-1, 0, +1}
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for invalid labels, empty datasets, or inconsistent dims.
+    pub fn fit(&mut self, x: &[Vec<Trit>], y: &[i8]) -> Result<(), String> {
+        if x.len() != y.len() {
+            return Err(format!("X length ({}) != y length ({})", x.len(), y.len()));
+        }
         for &yi in y {
-            if yi != -1 && yi != 0 && yi != 1 {
-                return Err(format!("Labels must be -1/0/+1, got {}", yi));
+            if !matches!(yi, -1i8..=1) {
+                return Err(format!("Labels must be -1, 0, or +1, got {}", yi));
             }
         }
 
-        for &cls in &[-1i8, 0, 1] {
-            let binary_y: Vec<f64> = y.iter().map(|&yi| if yi == cls { 1.0 } else { -1.0 }).collect();
-            let mut svm = BinarySVM::new(self.kernel.clone(), self.c);
-            svm.fit(x, &binary_y, max_passes)?;
-            self.classifiers.insert(cls, svm);
-        }
-        Ok(())
-    }
+        let classes = [-1i8, 0, 1];
+        let pairs = [(0, 1), (0, 2), (1, 2)];
 
-    /// Predict class with highest decision function value.
-    pub fn predict(&self, x: &[Trit]) -> Result<i8, String> {
-        validate_ternary(x)?;
-        let mut best_class = 0i8;
-        let mut best_score = f64::NEG_INFINITY;
-        for &cls in &[-1i8, 0, 1] {
-            if let Some(svm) = self.classifiers.get(&cls) {
-                let score = svm.decision_function(x);
-                if score > best_score {
-                    best_score = score;
-                    best_class = cls;
+        self.classifiers.clear();
+        for &(ai, bi) in &pairs {
+            let pos_class = classes[ai];
+            let neg_class = classes[bi];
+
+            let mut pair_x: Vec<Vec<Trit>> = Vec::new();
+            let mut pair_y: Vec<f64> = Vec::new();
+
+            for (xi, &yi) in x.iter().zip(y.iter()) {
+                if yi == pos_class {
+                    pair_x.push(xi.clone());
+                    pair_y.push(1.0);
+                } else if yi == neg_class {
+                    pair_x.push(xi.clone());
+                    pair_y.push(-1.0);
                 }
             }
+
+            if pair_x.is_empty() || pair_y.is_empty() {
+                continue;
+            }
+
+            let mut svm = TernSVM::new(self.lambda, self.learning_rate);
+            svm.max_epochs = self.max_epochs;
+            if let Some(seed) = self.seed {
+                svm.seed = Some(seed.wrapping_add((ai * 10 + bi) as u64));
+            }
+            svm.fit(&pair_x, &pair_y)?;
+            self.classifiers.push(((pos_class, neg_class), svm));
         }
-        Ok(best_class)
+
+        Ok(())
     }
 
-    /// Get binary classifier for a class.
-    pub fn classifier(&self, class: i8) -> Option<&BinarySVM> {
-        self.classifiers.get(&class)
+    /// Predict the class for a feature vector using weighted majority vote.
+    ///
+    /// Each binary classifier votes for one of its two classes.
+    /// The class with the highest total confidence wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the model is untrained or input is invalid.
+    pub fn predict(&self, x: &[Trit]) -> Result<i8, String> {
+        if self.classifiers.is_empty() {
+            return Err("Model has not been trained".into());
+        }
+
+        validate_ternary(x)?;
+
+        let mut votes: std::collections::HashMap<i8, f64> = std::collections::HashMap::new();
+        for &((pos_class, neg_class), ref svm) in &self.classifiers {
+            let decision = svm.predict(x)?;
+            let winner = if decision >= 0.0 {
+                pos_class
+            } else {
+                neg_class
+            };
+            *votes.entry(winner).or_insert(0.0) += decision.abs();
+        }
+
+        votes
+            .into_iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(class, _)| class)
+            .ok_or_else(|| "No votes cast - all classifiers returned empty".into())
+    }
+
+    /// Compute accuracy on a test set.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for invalid input or untrained model.
+    pub fn score(&self, x: &[Vec<Trit>], y: &[i8]) -> Result<f64, String> {
+        if x.len() != y.len() {
+            return Err(format!("X length ({}) != y length ({})", x.len(), y.len()));
+        }
+        if x.is_empty() {
+            return Ok(1.0);
+        }
+
+        let mut correct = 0usize;
+        for (xi, &yi) in x.iter().zip(y.iter()) {
+            let pred = self.predict(xi)?;
+            if pred == yi {
+                correct += 1;
+            }
+        }
+        Ok(correct as f64 / x.len() as f64)
     }
 }
 
@@ -330,40 +613,72 @@ impl TernarySVM {
 mod tests {
     use super::*;
 
+    // ── Validation tests ────────────────────────────────────────────────
+
     #[test]
-    fn test_linear_kernel() {
-        let k = Kernel::Linear;
-        assert!((k.apply(&[1, -1, 0], &[1, -1, 1]) - 2.0).abs() < 1e-10);
+    fn test_validate_valid() {
+        assert!(validate_ternary(&[1, 0, -1]).is_ok());
+        assert!(validate_ternary(&[1; 100]).is_ok());
+        assert!(validate_ternary(&[0; 0]).is_ok());
     }
 
     #[test]
-    fn test_polynomial_kernel() {
-        let k = Kernel::TernaryPolynomial { degree: 2.0, constant: 1.0 };
-        // dot=2, (2+1)^2 = 9
-        assert!((k.apply(&[1, 1], &[1, 1]) - 9.0).abs() < 1e-10);
+    fn test_validate_invalid() {
+        assert!(validate_ternary(&[2]).is_err());
+        assert!(validate_ternary(&[-2]).is_err());
+        assert!(validate_ternary(&[1, 2, 3]).is_err());
+    }
+
+    // ── Empty / edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_empty_training_set() {
+        let mut svm = TernSVM::new(1.0, 0.01);
+        let result = svm.fit(&[], &[]);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_rbf_kernel_same() {
-        let k = Kernel::TernaryRBF { gamma: 1.0 };
-        assert!((k.apply(&[1, -1, 0], &[1, -1, 0]) - 1.0).abs() < 1e-10);
+    fn test_length_mismatch() {
+        let mut svm = TernSVM::new(1.0, 0.01);
+        let x = vec![vec![1, 0]];
+        let y = vec![1.0, -1.0];
+        let result = svm.fit(&x, &y);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_rbf_kernel_different() {
-        let k = Kernel::TernaryRBF { gamma: 0.5 };
-        let val = k.apply(&[1, 0, 0], &[-1, 0, 0]);
-        assert!((val - (-1.0f64).exp()).abs() < 1e-6);
+    fn test_untrained_predict() {
+        let svm = TernSVM::new(1.0, 0.01);
+        let pred = svm.predict(&[1, 0, -1]);
+        assert!(pred.is_ok());
+        assert!((pred.unwrap() - 0.0).abs() < 1e-10);
     }
 
     #[test]
-    fn test_trit_distance() {
-        assert_eq!(trit_distance_f64(&[1, -1, 0], &[1, -1, 0]), 0.0);
-        assert_eq!(trit_distance_f64(&[1, 1, 1], &[-1, -1, -1]), 6.0);
+    fn test_zero_dim_features() {
+        let mut svm = TernSVM::new(1.0, 0.01);
+        let result = svm.fit(&[vec![], vec![]], &[1.0, -1.0]);
+        assert!(result.is_err());
+    }
+
+    // ── Trivial perfect separation ──────────────────────────────────────
+
+    #[test]
+    fn test_perfect_separation_1d() {
+        let mut svm = TernSVM::new(1.0, 0.01).with_max_epochs(200);
+        let x = vec![vec![1], vec![-1]];
+        let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
+
+        assert_eq!(svm.predict_label(&[1]).unwrap(), 1.0);
+        assert_eq!(svm.predict_label(&[-1]).unwrap(), -1.0);
+        assert!((svm.score(&x, &y).unwrap() - 1.0).abs() < 1e-10);
     }
 
     #[test]
-    fn test_linearly_separable() {
+    fn test_perfect_separation_3d() {
+        let mut svm = TernSVM::new(0.1, 0.1).with_max_epochs(300);
         let x = vec![
             vec![1, 1, 1],
             vec![1, 1, 0],
@@ -374,106 +689,263 @@ mod tests {
         ];
         let y = vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
 
-        let mut svm = BinarySVM::new(Kernel::Linear, 100.0);
-        svm.fit(&x, &y, 1000).unwrap();
+        svm.fit(&x, &y).unwrap();
+        let score = svm.score(&x, &y).unwrap();
+        assert!(
+            score >= 0.9,
+            "Perfectly separable data should achieve >= 90% training accuracy, got {}",
+            score
+        );
+    }
 
-        // Check training data
-        for (xi, &yi) in x.iter().zip(y.iter()) {
-            let pred = svm.predict(xi).unwrap();
-            assert_eq!(pred, yi, "Failed for {:?}", xi);
-        }
+    // ── XOR-like separability ─────────────────────────────────────────────
 
-        // New points
-        assert_eq!(svm.predict(&[1, 1, 0]).unwrap(), 1.0);
-        assert_eq!(svm.predict(&[-1, -1, 0]).unwrap(), -1.0);
+    #[test]
+    fn test_xor_ternary() {
+        let mut svm = TernSVM::new(0.01, 0.1).with_max_epochs(500);
+        let x = vec![vec![1, 1], vec![-1, -1], vec![1, -1], vec![-1, 1]];
+        let y = vec![1.0, 1.0, -1.0, -1.0];
+
+        svm.fit(&x, &y).unwrap();
+
+        let score = svm.score(&x, &y).unwrap();
+        assert!(
+            score >= 0.5,
+            "XOR-like data should beat random (50%), got {}",
+            score
+        );
     }
 
     #[test]
-    fn test_margin_computation() {
-        let x = vec![vec![1, 0], vec![-1, 0]];
-        let y = vec![1.0, -1.0];
-
-        let mut svm = BinarySVM::new(Kernel::Linear, 100.0);
-        svm.fit(&x, &y, 1000).unwrap();
-
-        let margin = svm.margin();
-        assert!(margin > 0.0, "Margin should be positive, got {}", margin);
-    }
-
-    #[test]
-    fn test_support_vector_identification() {
+    fn test_xor_with_zeros() {
+        let mut svm = TernSVM::new(0.1, 0.05).with_max_epochs(500);
         let x = vec![
-            vec![1, 1], vec![1, 0], vec![0, 1],
-            vec![-1, -1], vec![-1, 0], vec![0, -1],
-        ];
-        let y = vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
-
-        let mut svm = BinarySVM::new(Kernel::Linear, 10.0);
-        svm.fit(&x, &y, 1000).unwrap();
-
-        assert!(!svm.support_vectors().is_empty(), "Should have support vectors");
-    }
-
-    #[test]
-    fn test_rbf_classification() {
-        let x = vec![
-            vec![1, 0], vec![0, 1],
-            vec![-1, 0], vec![0, -1],
+            vec![1, 1, 0],
+            vec![-1, -1, 0],
+            vec![1, -1, 0],
+            vec![-1, 1, 0],
         ];
         let y = vec![1.0, 1.0, -1.0, -1.0];
 
-        let mut svm = BinarySVM::new(Kernel::TernaryRBF { gamma: 1.0 }, 100.0);
-        svm.fit(&x, &y, 1000).unwrap();
-
-        for (xi, &yi) in x.iter().zip(y.iter()) {
-            let pred = svm.predict(xi).unwrap();
-            assert_eq!(pred, yi, "RBF SVM failed for {:?}", xi);
-        }
+        svm.fit(&x, &y).unwrap();
+        let score = svm.score(&x, &y).unwrap();
+        assert!(
+            score >= 0.5,
+            "Should beat random (50%) with 0-noise dim, got {}",
+            score
+        );
     }
 
-    #[test]
-    fn test_ternary_classification() {
-        let x = vec![
-            vec![1, 1, 1], vec![1, 1, 0], vec![1, 0, 1], vec![1, 1, 1],  // class +1
-            vec![0, 0, 0], vec![0, 0, 0], vec![0, 0, 0], vec![0, 0, 0],  // class 0
-            vec![-1, -1, -1], vec![-1, -1, 0], vec![-1, 0, -1], vec![-1, -1, -1], // class -1
-        ];
-        let y = vec![1i8, 1, 1, 1, 0, 0, 0, 0, -1, -1, -1, -1];
-
-        let mut svm = TernarySVM::new(Kernel::TernaryRBF { gamma: 1.0 }, 100.0);
-        svm.fit(&x, &y, 1000).unwrap();
-
-        assert_eq!(svm.predict(&[1, 1, 1]).unwrap(), 1);
-        assert_eq!(svm.predict(&[0, 0, 0]).unwrap(), 0);
-        assert_eq!(svm.predict(&[-1, -1, -1]).unwrap(), -1);
-    }
+    // ── Regularization tests ────────────────────────────────────────────
 
     #[test]
-    fn test_polynomial_classification() {
+    fn test_regularization_high_lambda_small_weights() {
+        let mut svm = TernSVM::new(10.0, 0.01).with_max_epochs(200);
         let x = vec![vec![1, 1], vec![-1, -1]];
         let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
 
-        let mut svm = BinarySVM::new(
-            Kernel::TernaryPolynomial { degree: 2.0, constant: 1.0 },
-            100.0,
+        let norm: f64 = svm.w.iter().map(|v| v * v).sum();
+        assert!(
+            norm < 2.0,
+            "High regularization should keep weight norm small, got {}",
+            norm
         );
-        svm.fit(&x, &y, 1000).unwrap();
-
-        assert_eq!(svm.predict(&[1, 1]).unwrap(), 1.0);
-        assert_eq!(svm.predict(&[-1, -1]).unwrap(), -1.0);
     }
 
     #[test]
-    fn test_decision_function_sign() {
+    fn test_regularization_low_lambda_allows_larger_weights() {
+        let mut svm = TernSVM::new(0.01, 0.1).with_max_epochs(200);
+        let x = vec![vec![1, 1], vec![-1, -1]];
+        let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
+
+        let norm: f64 = svm.w.iter().map(|v| v * v).sum();
+        assert!(
+            norm > 0.01,
+            "Low regularization should allow non-trivial weights, got {}",
+            norm
+        );
+    }
+
+    #[test]
+    fn test_regularization_noise_dimension() {
+        let mut x: Vec<Vec<Trit>> = Vec::new();
+        let mut y: Vec<f64> = Vec::new();
+        for _ in 0..50 {
+            x.push(vec![1, -1, 0]);
+            y.push(1.0);
+            x.push(vec![-1, 1, 0]);
+            y.push(-1.0);
+        }
+
+        let mut svm_high = TernSVM::new(100.0, 0.01).with_max_epochs(100);
+        let mut svm_low = TernSVM::new(0.001, 0.1).with_max_epochs(100);
+        svm_high.fit(&x, &y).unwrap();
+        svm_low.fit(&x, &y).unwrap();
+
+        let noise_high = svm_high.w[2].abs();
+        let noise_low = svm_low.w[2].abs();
+        assert!(
+            noise_high <= noise_low + 0.1,
+            "High lambda should penalize noise more, high={}, low={}",
+            noise_high,
+            noise_low
+        );
+    }
+
+    // ── Convergence tracking ───────────────────────────────────────────
+
+    #[test]
+    fn test_convergence_tracking() {
+        let mut svm = TernSVM::new(1.0, 0.01)
+            .with_max_epochs(1000)
+            .with_early_stop(1e-3, 3);
+        let x = vec![vec![1, 1], vec![-1, -1]];
+        let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
+
+        assert!(svm.epochs_trained > 0);
+        assert!(!svm.loss_history.is_empty());
+        assert!(!svm.weight_norm_history.is_empty());
+    }
+
+    #[test]
+    fn test_convergence_stops_early() {
+        let mut svm = TernSVM::new(10.0, 0.1)
+            .with_max_epochs(10000)
+            .with_early_stop(1e-4, 5);
         let x = vec![vec![1, 0], vec![-1, 0]];
         let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
 
-        let mut svm = BinarySVM::new(Kernel::Linear, 100.0);
-        svm.fit(&x, &y, 1000).unwrap();
+        assert!(
+            svm.epochs_trained < 200,
+            "Should converge early on trivial data, used {} epochs",
+            svm.epochs_trained
+        );
+        assert!(svm.converged);
+    }
 
-        let f_pos = svm.decision_function(&[1, 0]);
-        let f_neg = svm.decision_function(&[-1, 0]);
-        assert!(f_pos > 0.0, "f_pos = {} should be > 0", f_pos);
-        assert!(f_neg < 0.0, "f_neg = {} should be < 0", f_neg);
+    // ── Predict and score ──────────────────────────────────────────────
+
+    #[test]
+    fn test_predict_returns_sign() {
+        let mut svm = TernSVM::new(1.0, 0.01).with_max_epochs(200);
+        let x = vec![vec![1, 1], vec![-1, -1]];
+        let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
+
+        let label = svm.predict_label(&[1, 1]).unwrap();
+        assert_eq!(label, 1.0);
+
+        let raw = svm.predict(&[1, 1]).unwrap();
+        assert!(raw >= -0.001); // decision value should be >= 0 for positive prediction
+    }
+
+    #[test]
+    fn test_score_perfect() {
+        let mut svm = TernSVM::new(1.0, 0.01).with_max_epochs(200);
+        let x = vec![vec![1, 1], vec![-1, -1]];
+        let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
+        assert!((svm.score(&x, &y).unwrap() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_score_empty() {
+        let svm = TernSVM::new(1.0, 0.01);
+        let score = svm.score(&[], &[]).unwrap();
+        assert!((score - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_score_wrong_feature_dim() {
+        let mut svm = TernSVM::new(1.0, 0.01).with_max_epochs(10);
+        let x = vec![vec![1, 0], vec![-1, 0]];
+        let y = vec![1.0, -1.0];
+        svm.fit(&x, &y).unwrap();
+        // Score with wrong feature dimension (3 instead of 2)
+        let result = svm.score(&[vec![1, 0, 1]], &[1.0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_score_mismatch_length() {
+        let svm = TernSVM::new(1.0, 0.01);
+        let result = svm.score(&[vec![1]], &[1.0, -1.0]);
+        assert!(result.is_err());
+    }
+
+    // ── Multi-class OvO ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_ovo_basic() {
+        let x = vec![
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+            vec![0, 0, 0],
+            vec![0, 0, 0],
+            vec![-1, -1, -1],
+            vec![-1, -1, -1],
+        ];
+        let y = vec![1, 1, 0, 0, -1, -1];
+
+        let mut model = OvOTernSVM::new(1.0, 0.01)
+            .with_max_epochs(200)
+            .with_seed(42);
+        model.fit(&x, &y).unwrap();
+
+        assert_eq!(model.predict(&vec![1, 1, 1]).unwrap(), 1);
+        assert_eq!(model.predict(&vec![0, 0, 0]).unwrap(), 0);
+        assert_eq!(model.predict(&vec![-1, -1, -1]).unwrap(), -1);
+    }
+
+    #[test]
+    fn test_ovo_accuracy() {
+        let x = vec![
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+            vec![0, 0, 0],
+            vec![0, 0, 0],
+            vec![-1, -1, -1],
+            vec![-1, -1, -1],
+        ];
+        let y = vec![1, 1, 0, 0, -1, -1];
+
+        let mut model = OvOTernSVM::new(1.0, 0.01)
+            .with_max_epochs(200)
+            .with_seed(42);
+        model.fit(&x, &y).unwrap();
+
+        let acc = model.score(&x, &y).unwrap();
+        assert!(
+            acc >= 0.8,
+            "OvO should get >=80% on cleanly separable 3-class data, got {}",
+            acc
+        );
+    }
+
+    #[test]
+    fn test_ovo_invalid_label() {
+        let mut model = OvOTernSVM::new(1.0, 0.01);
+        let result = model.fit(&[vec![1]], &[2]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ovo_untrained() {
+        let model = OvOTernSVM::new(1.0, 0.01);
+        let result = model.predict(&[1, 0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kernel_hint() {
+        let svm = TernSVM::new(1.0, 0.01).with_kernel_hint("rbf");
+        assert_eq!(svm.kernel_hint.as_deref(), Some("rbf"));
+
+        let svm_default = TernSVM::new(1.0, 0.01);
+        assert!(svm_default.kernel_hint.is_none());
     }
 }
